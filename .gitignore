@@ -1,0 +1,26 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.joblib.bak
+
+# Streamlit config / cache
+.streamlit/
+*/.streamlit/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
