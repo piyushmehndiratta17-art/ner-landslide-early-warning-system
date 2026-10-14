@@ -1,571 +1,732 @@
 """
-NER Landslide Early Warning & Risk Monitoring System
-Tech Expo Interactive Showcase Application
-Built with Streamlit, Folium, Plotly, and Scikit-Learn
+NER Landslide Early Warning System - command centre front end.
+
+Same backend contracts as the original app (src.ai_model, src.iot_simulator,
+src.ews_dispatcher, src.vision_analyzer, src.data_manager); only the
+presentation layer is new.
+
+Design rule: red / orange / yellow / green appear ONLY to mean risk.
 """
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-import folium
-from folium import plugins
-from streamlit_folium import st_folium
-import json
+import html as _html
+import math
 import os
-from PIL import Image
+import re
+import statistics
+import time
+import zlib
+from urllib.parse import quote
 
-from src.data_manager import NER_STATIONS, get_stations_dataframe
-from src.ai_model import LandslidePredictor, FEATURE_COLUMNS, FEATURE_LABELS
+import folium
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from PIL import Image
+from streamlit_folium import st_folium
+
+from src.data_manager import NER_STATIONS
+from src.ai_model import LandslidePredictor
 from src.iot_simulator import IoTSimulator, SCENARIOS
 from src.ews_dispatcher import EWSDispatcher
 from src.vision_analyzer import DroneSlopeAnalyzer
 
-# Page Configuration
 st.set_page_config(
-    page_title="NER AI Landslide Early Warning System",
+    page_title="NER Landslide Early Warning",
     page_icon="🏔️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom Styling
-st.markdown("""
-<style>
-    /* Dark cyber / Command Center Styling */
-    .main-header {
-        font-size: 2.1rem;
-        font-weight: 800;
-        letter-spacing: -0.5px;
-        background: linear-gradient(90deg, #38BDF8, #818CF8, #C084FC);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.2rem;
-    }
-    .sub-header {
-        font-size: 1.05rem;
-        color: #94A3B8;
-        margin-bottom: 1.2rem;
-    }
-    .metric-card {
-        background-color: #1E293B;
-        border: 1px solid #334155;
-        border-radius: 10px;
-        padding: 16px;
-        text-align: center;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
-    }
-    .metric-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        margin: 6px 0;
-    }
-    .metric-label {
-        font-size: 0.82rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: #94A3B8;
-    }
-    .badge-red {
-        background-color: #EF4444;
-        color: white;
-        padding: 3px 8px;
-        border-radius: 6px;
-        font-weight: 600;
-        font-size: 0.78rem;
-    }
-    .badge-orange {
-        background-color: #F97316;
-        color: white;
-        padding: 3px 8px;
-        border-radius: 6px;
-        font-weight: 600;
-        font-size: 0.78rem;
-    }
-    .badge-yellow {
-        background-color: #F59E0B;
-        color: black;
-        padding: 3px 8px;
-        border-radius: 6px;
-        font-weight: 600;
-        font-size: 0.78rem;
-    }
-    .badge-green {
-        background-color: #10B981;
-        color: white;
-        padding: 3px 8px;
-        border-radius: 6px;
-        font-weight: 600;
-        font-size: 0.78rem;
-    }
-    .sms-box {
-        background: #0F172A;
-        border-left: 4px solid #38BDF8;
-        padding: 12px;
-        border-radius: 0 8px 8px 0;
-        font-family: monospace;
-        margin-bottom: 10px;
-        color: #E2E8F0;
-    }
-</style>
-""", unsafe_allow_html=True)
+# --------------------------------------------------------------------------
+# Tokens
+# --------------------------------------------------------------------------
+INK = "#14261F"
+MUTED = "#5A6B63"
+RULE = "#CCD5CF"
+GRID = "#DCE3DE"
+FONT = "Public Sans, Noto Sans Bengali, system-ui, sans-serif"
 
-# Initialize Session State
+TIER_COLOR = {"GREEN": "#2E9E6B", "YELLOW": "#E2B100", "ORANGE": "#E8741A", "RED": "#D6342C"}
+TIER_TEXT = {"GREEN": INK, "YELLOW": INK, "ORANGE": INK, "RED": "#FFFFFF"}
+RED_TEXT = "#B72A23"  # red for small text on light backgrounds
+TIER_ORDER = ["RED", "ORANGE", "YELLOW", "GREEN"]
+LSI_BANDS = (0.35, 0.60, 0.80)
+
+CUSTOM_LABEL = "Custom sensor sandbox"
+
+# The drone analyzer reports its own tier names; map them onto the shared palette.
+VISION_TIER = {"LOW": "GREEN", "MODERATE": "YELLOW", "HIGH": "ORANGE", "CRITICAL": "RED"}
+
+
+def _st_version():
+    out = []
+    for part in st.__version__.split(".")[:2]:
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits or 0))
+    return tuple(out)
+
+
+# Streamlit replaced use_container_width with width="stretch" around 1.50.
+FILL = {"width": "stretch"} if _st_version() >= (1, 50) else {"use_container_width": True}
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+def esc(value):
+    return _html.escape(str(value))
+
+
+def md(markup):
+    """Render HTML. Lines are stripped so Markdown never sees indented code."""
+    st.markdown("".join(line.strip() for line in markup.splitlines()), unsafe_allow_html=True)
+
+
+def fmt(value, digits=1):
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return esc(value)
+
+
+def rgba(hex_color, alpha):
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def tier_color(tier, fallback="#2E9E6B"):
+    return TIER_COLOR.get(tier, fallback)
+
+
+def carto_key():
+    """CARTO basemap key from .streamlit/secrets.toml or the CARTO_API_KEY environment variable."""
+    try:
+        key = st.secrets.get("CARTO_API_KEY")
+    except Exception:
+        key = None
+    key = key or os.environ.get("CARTO_API_KEY") or ""
+    return re.sub(r"[^A-Za-z0-9_\-]", "", str(key))
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def clean_title(label):
+    """Drop leading emoji from scenario titles for display."""
+    return re.sub(r"^[^\w]+", "", label)
+
+
+def section(title, sub=None):
+    sub_html = f'<div class="sec-sub">{sub}</div>' if sub else ""
+    md(f'<div class="sec">{title}</div>{sub_html}')
+
+
+def plot(fig):
+    st.plotly_chart(fig, theme=None, config={"displayModeBar": False}, **FILL)
+
+
+def style_fig(fig, height):
+    fig.update_layout(
+        height=height,
+        margin=dict(l=4, r=4, t=30, b=4),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family=FONT, color=INK, size=12),
+        hoverlabel=dict(font_family=FONT),
+        legend=dict(orientation="h", y=1.1, x=0),
+    )
+    fig.update_xaxes(gridcolor=GRID, linecolor=RULE, zeroline=False)
+    fig.update_yaxes(gridcolor=GRID, linecolor=RULE, zeroline=False)
+    return fig
+
+
+def contour_uri():
+    """Topographic rings used as the hero background."""
+    cx, cy = 880, 230
+    rings = []
+    for k in range(1, 11):
+        base = 28 * k
+        pts = []
+        for i in range(121):
+            th = 2 * math.pi * i / 120
+            wob = 1 + 0.10 * math.sin(3 * th + k * 0.6) + 0.06 * math.sin(5 * th - k * 0.9) + 0.03 * math.sin(2 * th + k)
+            r = base * wob
+            pts.append(f"{cx + r * math.cos(th) * 1.7:.1f},{cy + r * math.sin(th) * 0.8:.1f}")
+        rings.append('<polygon points="' + " ".join(pts) + '"/>')
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" preserveAspectRatio="xMaxYMid slice">'
+        '<g fill="none" stroke="#8FD0B8" stroke-opacity="0.16" stroke-width="1.2">' + "".join(rings) + "</g></svg>"
+    )
+    return "data:image/svg+xml;utf8," + quote(svg)
+
+
+def meter_html(lsi):
+    """Susceptibility index on a 0-1 scale with the four alert bands."""
+    widths = (35, 25, 20, 20)
+    zones = "".join(
+        f'<i style="width:{w}%;background:{rgba(TIER_COLOR[t], 0.5)}"></i>'
+        for w, t in zip(widths, ("GREEN", "YELLOW", "ORANGE", "RED"))
+    )
+    pos = min(max(float(lsi), 0), 1) * 100
+    labels = "".join(f'<span style="left:{b * 100:.0f}%">{b:.2f}</span>' for b in LSI_BANDS)
+    return (
+        f'<div class="meter-wrap"><div class="meter">{zones}</div>'
+        f'<div class="marker" style="left:{pos:.1f}%"></div></div>'
+        f'<div class="meter-lbl">{labels}</div>'
+    )
+
+
+def sensor_html(name, value, unit, threshold, vmax):
+    value = float(value)
+    over = value >= threshold
+    fill = TIER_COLOR["RED"] if over else "#6F8A7E"
+    width = min(value / vmax, 1) * 100
+    tick = threshold / vmax * 100
+    note = f"Above the {threshold:g} {unit} alert level" if over else f"Alert level {threshold:g} {unit}"
+    note_cls = "s-note over" if over else "s-note"
+    return (
+        f'<div class="sensor"><div class="s-head"><span>{name}</span>'
+        f'<span class="s-val">{value:.1f} <small>{unit}</small></span></div>'
+        f'<div class="track"><div class="fill" style="width:{width:.1f}%;background:{fill}"></div>'
+        f'<div class="tick" style="left:{tick:.1f}%"></div></div>'
+        f'<div class="{note_cls}">{note}</div></div>'
+    )
+
+
+def chip(name, tier, size="1.25rem"):
+    """Tier name on its colour fill, always readable."""
+    return (
+        f'<span class="chip" style="background:{TIER_COLOR.get(tier, TIER_COLOR["GREEN"])};'
+        f'color:{TIER_TEXT.get(tier, INK)};font-size:{size}">{esc(name)}</span>'
+    )
+
+
+def stat_html(label, value):
+    return f'<div class="stat"><span>{label}</span><b>{value}</b></div>'
+
+
+# --------------------------------------------------------------------------
+# Styles
+# --------------------------------------------------------------------------
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Noto+Sans+Bengali:wght@400;600&family=Public+Sans:wght@400;500;600&display=swap');
+
+:root {
+  --ink:#14261F; --muted:#5A6B63; --rule:#CCD5CF; --mist:#EDF1EE; --spruce:#0D2A25;
+  --green:#2E9E6B; --yellow:#E2B100; --orange:#E8741A; --red:#D6342C;
+  --display:'Bricolage Grotesque','Public Sans',system-ui,sans-serif;
+}
+html, body, .stApp, .stApp *:not([data-testid="stIconMaterial"]):not(.material-icons):not(.material-symbols-rounded) {
+  font-family:'Public Sans','Noto Sans Bengali',system-ui,sans-serif; }
+/* keep Streamlit's own icon font so arrows and toolbar icons draw as icons, not as their names */
+[data-testid="stIconMaterial"], .material-icons, .material-symbols-rounded {
+  font-family:'Material Symbols Rounded','Material Icons' !important; }
+.stApp { background:var(--mist); color:var(--ink); }
+.block-container { max-width:1320px; padding-top:1.4rem; padding-bottom:3rem; }
+header[data-testid="stHeader"] { background:transparent; }
+#MainMenu, footer { visibility:hidden; }
+section[data-testid="stSidebar"] { background:#E1E8E3; border-right:1px solid var(--rule); }
+section[data-testid="stSidebar"] .block-container { padding-top:1.2rem; }
+@media (min-width:900px) { section[data-testid="stSidebar"][aria-expanded="true"] { width:350px !important; min-width:350px !important; } }
+
+/* sidebar */
+.wordmark { display:flex; align-items:center; gap:10px; font-family:var(--display); font-weight:700; font-size:1.15rem; letter-spacing:-0.01em; }
+.side-h { font-size:.82rem; font-weight:600; color:var(--muted); margin:22px 0 6px; }
+section[data-testid="stSidebar"] button[kind="primary"],
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {
+  background:var(--red); border-color:var(--red); color:#fff; font-weight:600; }
+section[data-testid="stSidebar"] button[kind="primary"]:hover,
+section[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:hover { background:#B72A23; border-color:#B72A23; color:#fff; }
+
+/* hero */
+.hero { position:relative; background:var(--spruce); color:#EAF2EE; border-radius:14px; padding:26px 32px 22px; overflow:hidden; margin-bottom:30px; }
+.hero::before { content:""; position:absolute; inset:0; background-image:url("__CONTOURS__"); background-size:cover; background-position:right center; pointer-events:none; }
+.hero > * { position:relative; }
+.hero-top { display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; font-size:.88rem; color:#9DB8AE; margin-bottom:34px; }
+.hero-top b { color:#fff; font-family:var(--display); font-size:1rem; font-weight:600; }
+.hero-grid { display:grid; grid-template-columns:minmax(0,5fr) minmax(0,6fr); gap:44px; align-items:end; }
+.hero-title { font-family:var(--display); font-weight:700; font-size:2.3rem; line-height:1.06; letter-spacing:-0.02em; color:#fff; margin:0 0 12px; }
+.hero-sub { color:#C3D6CE; font-size:1.02rem; max-width:34rem; }
+.hero-scn { color:#8FAEA3; font-size:.88rem; margin-top:6px; max-width:34rem; }
+.legend { display:flex; flex-wrap:wrap; gap:8px 22px; margin-top:22px; font-size:.9rem; color:#C3D6CE; }
+.legend .sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:7px; }
+.legend b { color:#fff; font-weight:600; margin-right:5px; }
+.ribbon { position:relative; height:88px; display:flex; align-items:flex-end; gap:4px; border-bottom:1px solid rgba(255,255,255,.28); }
+.ribbon .bar { flex:1; min-height:6px; border-radius:3px 3px 0 0; }
+.ribbon .gl { position:absolute; left:0; right:0; border-top:1px dashed rgba(255,255,255,.3); }
+.ribbon-ids { display:flex; gap:4px; margin-top:6px; font-size:.62rem; letter-spacing:-0.01em; color:#8FAEA3; }
+.ribbon-ids span { flex:1; min-width:0; text-align:center; overflow:visible; white-space:nowrap; }
+.ribbon-note { font-size:.78rem; color:#8FAEA3; margin-top:8px; }
+
+/* section headings */
+.sec { font-family:var(--display); font-weight:600; font-size:1.4rem; letter-spacing:-0.01em; margin:4px 0 2px; }
+.sec-sub { color:var(--muted); font-size:.94rem; margin-bottom:14px; max-width:46rem; line-height:1.5; }
+
+/* station table */
+.tbl-wrap { max-height:540px; overflow:auto; border-top:1px solid var(--rule); }
+.tbl { width:100%; border-collapse:collapse; font-size:.9rem; font-variant-numeric:tabular-nums; }
+.tbl th { text-align:right; font-weight:500; font-size:.78rem; color:var(--muted); padding:8px 8px; position:sticky; top:0; background:var(--mist); }
+.tbl th:first-child { text-align:left; }
+.tbl td { text-align:right; padding:9px 8px; border-bottom:1px solid var(--rule); }
+.tbl td.nm { text-align:left; border-left:4px solid var(--tc); padding-left:10px; }
+.tbl td.nm b { display:block; font-weight:600; }
+.tbl td.nm small { color:var(--muted); font-size:.78rem; }
+.tbl tr.sel td { background:rgba(20,38,31,.07); }
+.lsi { display:inline-block; min-width:44px; text-align:center; padding:2px 8px; border-radius:10px; font-weight:600; font-size:.82rem; }
+
+/* station status */
+.st-name { font-family:var(--display); font-weight:700; font-size:2rem; letter-spacing:-0.02em; margin:0 0 10px; }
+.meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:12px 26px; margin-bottom:22px; }
+.meta .k { font-size:.78rem; color:var(--muted); }
+.meta .v { font-weight:600; }
+.status { border-left:6px solid var(--tc); background:var(--bg); padding:16px 22px 14px; border-radius:0 10px 10px 0; margin-bottom:26px; }
+.status .tier { display:flex; align-items:center; flex-wrap:wrap; gap:12px; }
+.chip { display:inline-block; padding:3px 14px; border-radius:7px; font-family:var(--display); font-weight:700; line-height:1.3; }
+.status .tier small { font-weight:500; font-size:1rem; color:var(--ink); }
+.status .dir { margin-top:4px; max-width:48rem; }
+.status .ttf { margin-top:8px; font-weight:600; color:#B72A23; }
+.meter-wrap { position:relative; padding:6px 0; margin-top:12px; max-width:520px; }
+.meter { display:flex; height:10px; border-radius:5px; overflow:hidden; }
+.meter i { display:block; height:100%; }
+.marker { position:absolute; top:0; width:4px; height:22px; background:var(--ink); border-radius:2px; transform:translateX(-50%); }
+.meter-lbl { position:relative; height:16px; max-width:520px; font-size:.72rem; color:var(--muted); }
+.meter-lbl span { position:absolute; transform:translateX(-50%); }
+
+/* sensor bars */
+.sensor { margin-bottom:20px; }
+.s-head { display:flex; justify-content:space-between; align-items:baseline; font-weight:500; }
+.s-val { font-family:var(--display); font-weight:700; font-size:1.35rem; font-variant-numeric:tabular-nums; }
+.s-val small { font-family:'Public Sans',sans-serif; font-weight:400; font-size:.8rem; color:var(--muted); }
+.track { position:relative; height:8px; background:#D5DDD7; border-radius:4px; margin:6px 0 4px; }
+.track .fill { height:100%; border-radius:4px; }
+.track .tick { position:absolute; top:-4px; width:2px; height:16px; background:var(--ink); }
+.s-note { font-size:.78rem; color:var(--muted); }
+.s-note.over { color:#B72A23; font-weight:600; }
+
+/* stat rows */
+.stat { display:flex; justify-content:space-between; gap:12px; padding:9px 0; border-bottom:1px solid var(--rule); }
+.stat span { color:var(--muted); }
+.stat b { font-variant-numeric:tabular-nums; text-align:right; }
+
+/* alerts */
+.msg { border-left:3px solid var(--rule); padding:2px 0 2px 14px; margin-bottom:16px; }
+.msg .lang { font-size:.8rem; color:var(--muted); font-weight:600; }
+.msg p { margin:2px 0 0; line-height:1.5; }
+
+/* about */
+.flow { display:grid; grid-template-columns:repeat(4,1fr); border-top:2px solid var(--ink); margin:8px 0 30px; }
+.stage { padding:14px 18px 4px 0; }
+.stage .n { display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; border-radius:50%; background:var(--ink); color:#fff; font-size:.78rem; font-weight:600; }
+.stage h4 { font-family:var(--display); font-size:1.1rem; margin:8px 0 4px; padding:0; }
+.stage p { font-size:.9rem; color:var(--muted); margin:0; line-height:1.5; }
+.prose p, .prose li { line-height:1.6; max-width:42rem; }
+
+/* tabs */
+.stTabs [data-baseweb="tab-list"] { gap:26px; border-bottom:1px solid var(--rule); }
+.stTabs [data-baseweb="tab"] { padding:10px 0; height:auto; background:transparent; color:var(--muted); font-weight:500; }
+.stTabs [aria-selected="true"] { color:var(--ink); font-weight:600; }
+.stTabs [data-baseweb="tab-highlight"] { background:var(--ink); height:3px; }
+.stTabs [data-baseweb="tab-panel"] { padding-top:24px; }
+
+.foot { color:var(--muted); font-size:.82rem; margin-top:40px; padding-top:14px; border-top:1px solid var(--rule); }
+
+@media (max-width:900px) {
+  .hero { padding:20px; }
+  .hero-grid { grid-template-columns:1fr; gap:26px; }
+  .hero-title { font-size:2rem; }
+  .flow { grid-template-columns:1fr 1fr; }
+}
+</style>
+""".replace("__CONTOURS__", contour_uri())
+st.markdown(CSS, unsafe_allow_html=True)
+
+
+# --------------------------------------------------------------------------
+# Backend
+# --------------------------------------------------------------------------
 @st.cache_resource
 def load_system_core():
     predictor = LandslidePredictor()
     simulator = IoTSimulator(predictor)
     dispatcher = EWSDispatcher()
     vision_analyzer = DroneSlopeAnalyzer()
-    return predictor, simulator, dispatcher, vision_analyzer
+    # Time the real model so the About tab reports a measured figure.
+    probe = {"slope_deg": 40, "rainfall_24h": 120, "rainfall_72h_ari": 250, "rainfall_intensity_max": 20,
+             "soil_moisture_pct": 70, "pore_water_pressure_kpa": 30, "displacement_rate_mm_day": 3,
+             "lithology_factor": 3, "elevation_m": 1200, "ndvi": 0.5, "seismic_pga_g": 0.05}
+    predictor.predict_risk(probe)
+    runs = []
+    for _ in range(15):
+        t0 = time.perf_counter()
+        predictor.predict_risk(probe)
+        runs.append((time.perf_counter() - t0) * 1000)
+    return predictor, simulator, dispatcher, vision_analyzer, statistics.median(runs)
 
-predictor, simulator, dispatcher, vision_analyzer = load_system_core()
 
-# Sidebar Controls
-st.sidebar.image("https://img.icons8.com/isometric/100/mountain.png", width=65)
-st.sidebar.title("Command & Control")
+predictor, simulator, dispatcher, vision_analyzer, latency_ms = load_system_core()
 
-st.sidebar.markdown("### 🎛️ Tech Expo Demo Scenarios")
+# Readings hold steady between interactions; "Refresh readings" draws a new set.
+if "tick" not in st.session_state:
+    st.session_state["tick"] = 0
+
+# --------------------------------------------------------------------------
+# Sidebar
+# --------------------------------------------------------------------------
 scenario_keys = list(SCENARIOS.keys())
-scenario_labels = [SCENARIOS[k]["title"] for k in scenario_keys] + ["🛠️ Custom Sensor Simulation Sandbox"]
+scenario_labels = [SCENARIOS[k]["title"] for k in scenario_keys] + [CUSTOM_LABEL]
 
-selected_scenario_label = st.sidebar.selectbox(
-    "Active Operational Scenario:",
-    scenario_labels,
-    index=1 # Default to Monsoon Deluge for impressive immediate visual impact
-)
+with st.sidebar:
+    md(
+        '<div class="wordmark">'
+        '<svg width="30" height="30" viewBox="0 0 30 30" fill="none">'
+        '<rect width="30" height="30" rx="7" fill="#0D2A25"/>'
+        '<path d="M4 22 L12 10 L16 16 L19 12 L26 22 Z" fill="#8FD0B8"/></svg>'
+        "NER Landslide EWS</div>"
+    )
 
-is_custom = selected_scenario_label.startswith("🛠️")
-if not is_custom:
-    selected_scenario_key = [k for k in scenario_keys if SCENARIOS[k]["title"] == selected_scenario_label][0]
-    st.sidebar.caption(SCENARIOS[selected_scenario_key]["description"])
-else:
-    selected_scenario_key = "baseline"
-    st.sidebar.caption("Custom Sandbox mode: Use the sliders in the Sandbox tab or sidebar to manipulate slope parameters.")
+    md('<div class="side-h">Scenario</div>')
+    selected_scenario_label = st.selectbox(
+        "Scenario",
+        scenario_labels,
+        index=1,
+        format_func=clean_title,
+        label_visibility="collapsed",
+    )
+    is_custom = selected_scenario_label == CUSTOM_LABEL
+    if is_custom:
+        selected_scenario_key = "baseline"
+        st.caption("Set the sensor values below. Every tab updates with them.")
+    else:
+        selected_scenario_key = next(k for k in scenario_keys if SCENARIOS[k]["title"] == selected_scenario_label)
+        st.caption(SCENARIOS[selected_scenario_key]["description"])
 
-# Station Selector for Deep-Dive
-station_names = [f"{s['id']} - {s['name']} ({s['state']})" for s in NER_STATIONS]
-selected_station_str = st.sidebar.selectbox("Inspect Monitoring Station:", station_names, index=2)
-selected_station_id = selected_station_str.split(" - ")[0]
-selected_station_meta = next(s for s in NER_STATIONS if s["id"] == selected_station_id)
+    if st.button("Refresh readings", **FILL):
+        st.session_state["tick"] += 1
+    st.caption("Readings hold steady while you work. Refresh draws a new set.")
 
-# Custom override state
-custom_overrides = None
-if is_custom:
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(f"#### ⚙️ Override: {selected_station_id}")
-    c_rain = st.sidebar.slider("24h Rainfall (mm)", 0.0, 350.0, 220.0, 5.0)
-    c_slope = st.sidebar.slider("Slope Angle (°)", 15.0, 65.0, float(selected_station_meta["slope_deg"]), 0.5)
-    c_moist = st.sidebar.slider("Soil Moisture (%)", 15.0, 98.0, 88.0, 1.0)
-    c_pwp = st.sidebar.slider("Pore Water Pressure (kPa)", 0.0, 80.0, 52.0, 1.0)
-    c_disp = st.sidebar.slider("Displacement Rate (mm/day)", 0.0, 35.0, 12.5, 0.5)
-    c_pga = st.sidebar.slider("Seismic PGA (g)", 0.01, 0.45, 0.08, 0.01)
+    md('<div class="side-h">Station</div>')
+    station_lookup = {s["id"]: s for s in NER_STATIONS}
+    selected_station_id = st.selectbox(
+        "Station",
+        list(station_lookup),
+        index=2,
+        format_func=lambda i: f"{station_lookup[i]['name']}, {station_lookup[i]['state']}",
+        label_visibility="collapsed",
+    )
+    selected_station_meta = station_lookup[selected_station_id]
 
-    custom_overrides = {
-        "stn_id": selected_station_id,
-        "rainfall_24h": c_rain,
-        "slope_deg": c_slope,
-        "soil_moisture_pct": c_moist,
-        "pore_water_pressure_kpa": c_pwp,
-        "displacement_rate_mm_day": c_disp,
-        "seismic_pga_g": c_pga
-    }
+    custom_overrides = None
+    if is_custom:
+        md('<div class="side-h">Sensor values</div>')
+        c_rain = st.slider("24-hour rainfall (mm)", 0.0, 350.0, 220.0, 5.0)
+        c_slope = st.slider("Slope angle (°)", 15.0, 65.0, float(selected_station_meta["slope_deg"]), 0.5)
+        c_moist = st.slider("Soil moisture (%)", 15.0, 98.0, 88.0, 1.0)
+        c_pwp = st.slider("Pore water pressure (kPa)", 0.0, 80.0, 52.0, 1.0)
+        c_disp = st.slider("Displacement rate (mm/day)", 0.0, 35.0, 12.5, 0.5)
+        c_pga = st.slider("Seismic PGA (g)", 0.01, 0.45, 0.08, 0.01)
+        custom_overrides = {
+            "stn_id": selected_station_id,
+            "rainfall_24h": c_rain,
+            "slope_deg": c_slope,
+            "soil_moisture_pct": c_moist,
+            "pore_water_pressure_kpa": c_pwp,
+            "displacement_rate_mm_day": c_disp,
+            "seismic_pga_g": c_pga,
+        }
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🚨 Emergency Actions")
-siren_triggered = st.sidebar.button("🔊 Sound Area Siren & Broadcast Alert", type="primary", use_container_width=True)
+    md('<div class="side-h">Emergency</div>')
+    siren_triggered = st.button("Sound siren and broadcast alert", type="primary", **FILL)
+    if siren_triggered:
+        st.success("Demo broadcast sent to SACHET and SDRF.")
+        st.markdown(
+            '<audio autoplay><source src="https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg" type="audio/ogg"></audio>',
+            unsafe_allow_html=True,
+        )
 
-if siren_triggered:
-    st.sidebar.success("⚠️ Common Alerting Protocol (CAP) Broadcast Dispatched to SACHET & SDRF!")
-    # Audio Alert element
-    st.markdown("""
-    <audio autoplay>
-      <source src="https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg" type="audio/ogg">
-    </audio>
-    """, unsafe_allow_html=True)
-
-# Fetch Current Telemetry for all stations
+np.random.seed(zlib.crc32(f"{selected_scenario_key}-{st.session_state['tick']}".encode()))
 all_telemetry = simulator.get_all_stations_telemetry(
     scenario_key=selected_scenario_key,
-    custom_overrides=custom_overrides
+    custom_overrides=custom_overrides,
 )
-active_telemetry = next(t for t in all_telemetry if t["station_id"] == selected_station_id)
+active = next(t for t in all_telemetry if t["station_id"] == selected_station_id)
+scenario_name = clean_title(selected_scenario_label)
+sb_suffix = f"{selected_scenario_key}_{'custom' if is_custom else 'preset'}_{selected_station_id}"
 
-# Top Bar Header
-col_t1, col_t2 = st.columns([3, 1])
-with col_t1:
-    st.markdown('<div class="main-header">🏔️ AI Landslide Early Warning & Risk Monitoring System</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Deployment Sector: <b>North Eastern Region (NER), India</b> | Real-Time IoT Telemetry & Physics-Informed ML</div>', unsafe_allow_html=True)
-with col_t2:
-    st.markdown("""
-    <div style="text-align: right; padding-top: 10px;">
-        <span style="display: inline-block; width: 10px; height: 10px; background: #10B981; border-radius: 50%; margin-right: 5px;"></span>
-        <span style="color: #10B981; font-weight: 600; font-size: 0.9rem;">MESH GATEWAYS ONLINE</span><br>
-        <small style="color: #94A3B8;">LoRaWAN • 865 MHz • 12 Nodes</small>
+# --------------------------------------------------------------------------
+# Hero
+# --------------------------------------------------------------------------
+counts = {t: sum(1 for x in all_telemetry if x["tier"] == t) for t in TIER_ORDER}
+peak = max(all_telemetry, key=lambda x: x["lsi"])
+mean_rain = float(np.mean([x["rainfall_24h"] for x in all_telemetry]))
+
+if counts["RED"]:
+    headline = f"Evacuation advised at {plural(counts['RED'], 'station')}"
+elif counts["ORANGE"]:
+    headline = f"High alert at {plural(counts['ORANGE'], 'station')}"
+elif counts["YELLOW"]:
+    headline = f"{plural(counts['YELLOW'], 'station')} on advisory"
+else:
+    headline = "All stations within normal range"
+
+peak_line = f"{esc(peak['station_name'])}, {esc(peak['state'])} has the highest index at {fmt(peak['lsi'], 2)}."
+
+ranked = sorted(all_telemetry, key=lambda x: x["lsi"], reverse=True)
+bars = "".join(
+    f'<div class="bar" title="{esc(x["station_name"])}: {fmt(x["lsi"], 2)}" '
+    f'style="height:{max(min(float(x["lsi"]), 1) * 100, 4):.1f}%;background:{tier_color(x["tier"], x["color"])}"></div>'
+    for x in ranked
+)
+gridlines = "".join(f'<div class="gl" style="bottom:{b * 100:.0f}%"></div>' for b in LSI_BANDS)
+ids = "".join(f"<span>{esc(str(x['station_id']).replace('STN-', ''))}</span>" for x in ranked)
+legend = "".join(
+    f'<span><i class="sw" style="background:{TIER_COLOR[t]}"></i><b>{counts[t]}</b>{t.capitalize()}</span>'
+    for t in TIER_ORDER
+)
+
+md(
+    f"""
+<div class="hero">
+  <div class="hero-top">
+    <b>NER Landslide Early Warning</b>
+    <span>{len(all_telemetry)} stations reporting over LoRaWAN, 865 MHz</span>
+  </div>
+  <div class="hero-grid">
+    <div>
+      <div class="hero-title">{headline}</div>
+      <div class="hero-sub">{peak_line}</div>
+      <div class="hero-scn">{esc(scenario_name)}</div>
+      <div class="legend">{legend}<span>Mean 24-hour rainfall <b style="margin-left:5px">{mean_rain:.0f} mm</b></span></div>
     </div>
-    """, unsafe_allow_html=True)
-
-# High-Level KPI Summary Cards
-kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-
-red_count = sum(1 for t in all_telemetry if t["tier"] == "RED")
-orange_count = sum(1 for t in all_telemetry if t["tier"] == "ORANGE")
-yellow_count = sum(1 for t in all_telemetry if t["tier"] == "YELLOW")
-highest_risk_stn = max(all_telemetry, key=lambda x: x["lsi"])
-avg_rain = np.mean([t["rainfall_24h"] for t in all_telemetry])
-
-with kpi1:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">Monitored Stations</div>
-        <div class="metric-value" style="color: #38BDF8;">{len(all_telemetry)}</div>
-        <small style="color: #94A3B8;">Across 8 NE States</small>
+    <div>
+      <div class="ribbon">{gridlines}{bars}</div>
+      <div class="ribbon-ids">{ids}</div>
+      <div class="ribbon-note">Bar height is each station's susceptibility index, highest first. Dashed lines mark the yellow, orange and red thresholds.</div>
     </div>
-    """, unsafe_allow_html=True)
+  </div>
+</div>
+"""
+)
 
-with kpi2:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">Critical Red Alerts</div>
-        <div class="metric-value" style="color: {'#EF4444' if red_count > 0 else '#10B981'};">{red_count}</div>
-        <small style="color: #94A3B8;">Evacuation Triggered</small>
-    </div>
-    """, unsafe_allow_html=True)
+tab_map, tab_station, tab_sandbox, tab_vision, tab_alerts, tab_about = st.tabs(
+    ["Map", "Station", "Sandbox", "Drone imagery", "Alerts", "About"]
+)
 
-with kpi3:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">Warning Orange Alerts</div>
-        <div class="metric-value" style="color: {'#F97316' if orange_count > 0 else '#10B981'};">{orange_count}</div>
-        <small style="color: #94A3B8;">SDRF High Standby</small>
-    </div>
-    """, unsafe_allow_html=True)
-
-with kpi4:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">Peak Regional LSI</div>
-        <div class="metric-value" style="color: {highest_risk_stn['color']};">{highest_risk_stn['lsi']}</div>
-        <small style="color: #94A3B8;">{highest_risk_stn['station_id']}</small>
-    </div>
-    """, unsafe_allow_html=True)
-
-with kpi5:
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">Mean 24h Rainfall</div>
-        <div class="metric-value" style="color: #A78BFA;">{avg_rain:.1f} mm</div>
-        <small style="color: #94A3B8;">Regional Average</small>
-    </div>
-    """, unsafe_allow_html=True)
-
-st.markdown("<br>", unsafe_allow_html=True)
-
-# Main Navigation Tabs
-tab_map, tab_diag, tab_sandbox, tab_vision, tab_ews, tab_pitch = st.tabs([
-    "🗺️ Geospatial Map & Hotspots",
-    "📊 Station Telemetry & AI Diagnostics",
-    "📡 Interactive Sensor Sandbox",
-    "🛸 Drone Aerial Crack Detection (CV)",
-    "📢 Early Warning & CAP Alerts",
-    "🎓 Tech Expo Pitch & Architecture"
-])
-
-# ---------------- TAB 1: GEOSPATIAL MAP ----------------
+# --------------------------------------------------------------------------
+# Map
+# --------------------------------------------------------------------------
 with tab_map:
-    st.markdown("### 🗺️ Real-Time Landslide Hazard Map: North Eastern Region")
-    st.caption("Interactive Leaflet GIS representation of the 8 NER states. Click any station marker for telemetry popup or select in sidebar.")
+    section(
+        "Hazard map",
+        "Pins show each station's susceptibility index. Shaded circles mark evacuation and standby zones. "
+        "Choose a station in the sidebar to open it in the Station tab.",
+    )
+    col_map, col_tbl = st.columns([3, 2], gap="large")
 
-    col_map_view, col_table_view = st.columns([3, 2])
+    with col_map:
+        key = carto_key()
+        if key:
+            fmap = folium.Map(tiles=None, control_scale=True, zoom_control=True)
+            folium.TileLayer(
+                tiles=f"https://basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}.png?key={key}",
+                attr="&copy; OpenStreetMap contributors &copy; CARTO",
+                max_zoom=19,
+            ).add_to(fmap)
+        else:
+            fmap = folium.Map(tiles="OpenStreetMap", control_scale=True, zoom_control=True)
+        lats = [t["lat"] for t in all_telemetry]
+        lons = [t["lon"] for t in all_telemetry]
+        fmap.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(40, 40))
 
-    with col_map_view:
-        # Create Folium Map centered on NER
-        m = folium.Map(
-            location=[25.8, 92.6],
-            zoom_start=7,
-            tiles="OpenStreetMap",
-            control_scale=True
+        fmap.get_root().html.add_child(
+            folium.Element(
+                """
+<style>
+.leaflet-tile-pane { filter:grayscale(1) contrast(.92) brightness(1.04); }
+.ner-pin span { display:block; min-width:42px; height:26px; line-height:22px; text-align:center; border-radius:13px;
+  border:2px solid #fff; font:700 12px/22px 'Public Sans',system-ui,sans-serif; box-shadow:0 1px 4px rgba(0,0,0,.35); }
+.ner-pin.sel span { outline:3px solid #14261F; outline-offset:1px; }
+.ner-pin.RED span { animation:pulse 1.8s ease-out infinite; }
+@keyframes pulse { 0% { box-shadow:0 0 0 0 rgba(214,52,44,.55);} 100% { box-shadow:0 0 0 16px rgba(214,52,44,0);} }
+@media (prefers-reduced-motion: reduce) { .ner-pin.RED span { animation:none; } }
+</style>
+"""
+            )
         )
 
-        # Add Marker Cluster or colored markers
         for stn in all_telemetry:
-            # Color logic
-            tier_col = stn["tier"]
-            marker_color = "red" if tier_col == "RED" else "orange" if tier_col == "ORANGE" else "beige" if tier_col == "YELLOW" else "green"
-            
-            popup_html = f"""
-            <div style="font-family: Arial; width: 230px;">
-                <h4 style="margin: 0; color: #1E293B;">{stn['station_name']}</h4>
-                <p style="margin: 2px 0 6px 0; color: #64748B; font-size: 11px;">{stn['district']}, {stn['state']} ({stn['station_id']})</p>
-                <hr style="margin: 4px 0;">
-                <b>Alert Tier:</b> <span style="color: {stn['color']}; font-weight: bold;">{stn['tier']} ({stn['lsi']})</span><br>
-                <b>24h Rainfall:</b> {stn['rainfall_24h']} mm<br>
-                <b>Pore Pressure:</b> {stn['pore_water_pressure_kpa']} kPa<br>
-                <b>Displacement:</b> {stn['displacement_rate_mm_day']} mm/day<br>
-                <b>Slope:</b> {stn['slope_deg']}°<br>
-                <div style="margin-top: 6px; padding: 4px; background: #F1F5F9; border-radius: 4px; font-size: 11px;">
-                    <b>Action:</b> {stn['action_code']}
-                </div>
-            </div>
-            """
-            
-            # Draw Danger buffer circle for RED/ORANGE
-            if tier_col in ["RED", "ORANGE"]:
+            col = tier_color(stn["tier"], stn["color"])
+            if stn["tier"] in ("RED", "ORANGE"):
                 folium.Circle(
                     location=[stn["lat"], stn["lon"]],
-                    radius=12000 if tier_col == "RED" else 6000,
-                    color=stn["color"],
-                    fill=True,
-                    fill_color=stn["color"],
-                    fill_opacity=0.25,
-                    popup=f"Hazard Zone: {stn['station_name']}"
-                ).add_to(m)
+                    radius=12000 if stn["tier"] == "RED" else 6000,
+                    color=col, weight=1, fill=True, fill_color=col, fill_opacity=0.18,
+                ).add_to(fmap)
 
+            popup = (
+                f"<div style=\"font-family:'Public Sans',Arial,sans-serif;width:220px;color:#14261F\">"
+                f"<div style='font-weight:700;font-size:15px'>{esc(stn['station_name'])}</div>"
+                f"<div style='color:#5A6B63;font-size:12px;margin-bottom:6px'>{esc(stn['district'])}, {esc(stn['state'])}</div>"
+                f"<div style='font-weight:700;color:{col}'>{esc(stn['tier'])}, index {fmt(stn['lsi'], 2)}</div>"
+                f"<div style='font-size:13px;line-height:1.6'>"
+                f"Rainfall (24 h): {fmt(stn['rainfall_24h'])} mm<br>"
+                f"Pore pressure: {fmt(stn['pore_water_pressure_kpa'])} kPa<br>"
+                f"Displacement: {fmt(stn['displacement_rate_mm_day'])} mm/day<br>"
+                f"Slope: {fmt(stn['slope_deg'], 0)}°</div>"
+                f"<div style='margin-top:6px;padding:6px 8px;background:#EDF1EE;border-radius:4px;font-size:12px'>{esc(stn['action_code'])}</div>"
+                f"</div>"
+            )
+            sel = " sel" if stn["station_id"] == selected_station_id else ""
+            pin = (
+                f'<div class="ner-pin {stn["tier"]}{sel}"><span style="background:{col};color:{TIER_TEXT.get(stn["tier"], "#fff")}">'
+                f'{fmt(stn["lsi"], 2)}</span></div>'
+            )
             folium.Marker(
                 location=[stn["lat"], stn["lon"]],
-                popup=folium.Popup(popup_html, max_width=260),
-                tooltip=f"{stn['station_name']} [{stn['tier']} - LSI {stn['lsi']}]",
-                icon=folium.Icon(color=marker_color, icon="warning-sign" if tier_col in ["RED", "ORANGE"] else "info-sign")
-            ).add_to(m)
+                popup=folium.Popup(popup, max_width=260),
+                tooltip=f"{stn['station_name']} ({stn['state']})",
+                icon=folium.DivIcon(html=pin, icon_size=(46, 28), icon_anchor=(23, 14), class_name="ner-pin-wrap"),
+            ).add_to(fmap)
 
-        # Render Map in Streamlit
-        st_folium(m, width="100%", height=520)
+        st_folium(fmap, width="100%", height=540, returned_objects=[])
 
-    with col_table_view:
-        st.markdown("#### 📋 Regional Station Hazard Matrix")
-        
-        table_rows = []
-        for t in sorted(all_telemetry, key=lambda x: x["lsi"], reverse=True):
-            table_rows.append({
-                "Station": t["station_name"],
-                "State": t["state"],
-                "LSI": t["lsi"],
-                "Tier": t["tier"],
-                "Rain (mm)": t["rainfall_24h"],
-                "PWP (kPa)": t["pore_water_pressure_kpa"],
-                "Disp (mm/d)": t["displacement_rate_mm_day"]
-            })
-        
-        df_display = pd.DataFrame(table_rows)
-
-        def style_tier(val):
-            if val == "RED":
-                return "background-color: #EF4444; color: white; font-weight: bold;"
-            elif val == "ORANGE":
-                return "background-color: #F97316; color: white; font-weight: bold;"
-            elif val == "YELLOW":
-                return "background-color: #F59E0B; color: black; font-weight: bold;"
-            return "background-color: #10B981; color: white; font-weight: bold;"
-
-        st.dataframe(
-            df_display.style.map(style_tier, subset=["Tier"]),
-            height=460,
-            use_container_width=True
+    with col_tbl:
+        rows = []
+        for t in ranked:
+            c = tier_color(t["tier"], t["color"])
+            sel = " sel" if t["station_id"] == selected_station_id else ""
+            rows.append(
+                f'<tr class="{sel.strip()}" style="--tc:{c}">'
+                f'<td class="nm"><b>{esc(t["station_name"])}</b><small>{esc(t["state"])}</small></td>'
+                f'<td><span class="lsi" style="background:{c};color:{TIER_TEXT.get(t["tier"], "#fff")}">{fmt(t["lsi"], 2)}</span></td>'
+                f'<td>{fmt(t["rainfall_24h"], 0)}</td>'
+                f'<td>{fmt(t["pore_water_pressure_kpa"], 0)}</td>'
+                f'<td>{fmt(t["displacement_rate_mm_day"])}</td></tr>'
+            )
+        md(
+            '<div class="tbl-wrap"><table class="tbl"><thead><tr>'
+            "<th>Station</th><th>Index</th><th>Rain mm</th><th>Pore kPa</th><th>Disp mm/d</th>"
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
         )
 
-# ---------------- TAB 2: TELEMETRY & AI DIAGNOSTICS ----------------
-with tab_diag:
-    st.markdown(f"### 📊 Telemetry & AI Diagnostic Center: `{active_telemetry['station_name']}`")
-    st.markdown(f"**State:** {active_telemetry['state']} | **District:** {active_telemetry['district']} | **Elevation:** {active_telemetry['elevation_m']} m | **Lithology:** {active_telemetry['lithology']}")
-
-    # Diagnostic Top Status Banner
-    st.markdown(f"""
-    <div style="background-color: {active_telemetry['color']}22; border-left: 6px solid {active_telemetry['color']}; padding: 14px 18px; border-radius: 8px; margin-bottom: 20px;">
-        <span style="font-size: 1.25rem; font-weight: 700; color: {active_telemetry['color']};">
-            STATUS: {active_telemetry['tier']} - {active_telemetry['tier_label']} (LSI: {active_telemetry['lsi']})
-        </span>
-        <br>
-        <span style="color: #E2E8F0; font-size: 0.95rem;">
-            <b>Operational Directive:</b> {active_telemetry['action_code']}
-        </span>
-        {f"<br><span style='color: #FCA5A5; font-weight: bold;'>⚠️ Saito Inverse-Velocity Forecast: Estimated Time to Failure ~ {active_telemetry['ttf_hours']} Hours!</span>" if active_telemetry.get("ttf_hours") else ""}
-    </div>
-    """, unsafe_allow_html=True)
-
-    # 4 Key IoT Gauges
-    g_col1, g_col2, g_col3, g_col4 = st.columns(4)
-
-    with g_col1:
-        fig_g1 = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=active_telemetry["rainfall_24h"],
-            title={"text": "24h Rain (mm)"},
-            gauge={
-                "axis": {"range": [0, 350]},
-                "bar": {"color": "#38BDF8"},
-                "steps": [
-                    {"range": [0, 65], "color": "#1E293B"},
-                    {"range": [65, 150], "color": "#334155"},
-                    {"range": [150, 350], "color": "#475569"}
-                ],
-                "threshold": {"line": {"color": "red", "width": 4}, "thickness": 0.75, "value": 150}
-            }
-        ))
-        fig_g1.update_layout(height=200, margin=dict(l=15, r=15, t=35, b=15), paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_g1, use_container_width=True)
-
-    with g_col2:
-        fig_g2 = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=active_telemetry["soil_moisture_pct"],
-            title={"text": "Soil Moisture (%)"},
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar": {"color": "#10B981"},
-                "steps": [
-                    {"range": [0, 60], "color": "#1E293B"},
-                    {"range": [60, 85], "color": "#334155"},
-                    {"range": [85, 100], "color": "#475569"}
-                ],
-                "threshold": {"line": {"color": "red", "width": 4}, "thickness": 0.75, "value": 85}
-            }
-        ))
-        fig_g2.update_layout(height=200, margin=dict(l=15, r=15, t=35, b=15), paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_g2, use_container_width=True)
-
-    with g_col3:
-        fig_g3 = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=active_telemetry["pore_water_pressure_kpa"],
-            title={"text": "Pore Pressure (kPa)"},
-            gauge={
-                "axis": {"range": [0, 80]},
-                "bar": {"color": "#F59E0B"},
-                "steps": [
-                    {"range": [0, 25], "color": "#1E293B"},
-                    {"range": [25, 50], "color": "#334155"},
-                    {"range": [50, 80], "color": "#475569"}
-                ],
-                "threshold": {"line": {"color": "red", "width": 4}, "thickness": 0.75, "value": 45}
-            }
-        ))
-        fig_g3.update_layout(height=200, margin=dict(l=15, r=15, t=35, b=15), paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_g3, use_container_width=True)
-
-    with g_col4:
-        fig_g4 = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=active_telemetry["displacement_rate_mm_day"],
-            title={"text": "Displacement (mm/d)"},
-            gauge={
-                "axis": {"range": [0, 30]},
-                "bar": {"color": "#EF4444"},
-                "steps": [
-                    {"range": [0, 2], "color": "#1E293B"},
-                    {"range": [2, 8], "color": "#334155"},
-                    {"range": [8, 30], "color": "#475569"}
-                ],
-                "threshold": {"line": {"color": "red", "width": 4}, "thickness": 0.75, "value": 8.0}
-            }
-        ))
-        fig_g4.update_layout(height=200, margin=dict(l=15, r=15, t=35, b=15), paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_g4, use_container_width=True)
-
-    # Historical 24h Sensor Trend Curve & Explainability
-    st.markdown("---")
-    c_trend1, c_trend2 = st.columns([3, 2])
-
-    df_24h = simulator.generate_24h_history(active_telemetry)
-
-    with c_trend1:
-        st.markdown("#### 📈 24-Hour Telemetry Dynamics (Hourly Rain vs Pore Pressure & Displacement)")
-        fig_trend = go.Figure()
-        fig_trend.add_trace(go.Bar(
-            x=df_24h["Time"], y=df_24h["Rainfall_mm"], name="Hourly Rain (mm)", marker_color="rgba(56, 189, 248, 0.6)"
-        ))
-        fig_trend.add_trace(go.Scatter(
-            x=df_24h["Time"], y=df_24h["Pore_Pressure_kPa"], name="Pore Pressure (kPa)", line=dict(color="#F59E0B", width=3), yaxis="y2"
-        ))
-        fig_trend.add_trace(go.Scatter(
-            x=df_24h["Time"], y=df_24h["Displacement_mm_day"], name="Displacement (mm/day)", line=dict(color="#EF4444", width=3, dash="dot"), yaxis="y2"
-        ))
-
-        fig_trend.update_layout(
-            height=340,
-            margin=dict(l=20, r=20, t=30, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            yaxis=dict(title="Rainfall (mm)"),
-            yaxis2=dict(title="PWP (kPa) & Disp (mm/d)", overlaying="y", side="right"),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)"
-        )
-        st.plotly_chart(fig_trend, use_container_width=True)
-
-    with c_trend2:
-        st.markdown("#### 🧠 Explainable AI: Feature Risk Contribution")
-        st.caption("Quantifies dynamic driving vs. mitigating factors for this slope.")
-        
-        top_factors = active_telemetry["top_factors"]
-        df_factors = pd.DataFrame(top_factors)
-        
-        fig_factors = px.bar(
-            df_factors,
-            x="score",
-            y="factor",
-            orientation="h",
-            color="direction",
-            color_discrete_map={"Aggravating": "#EF4444", "Mitigating": "#10B981"},
-            labels={"score": "Contribution Weight", "factor": "Factor"}
-        )
-        fig_factors.update_layout(
-            height=340,
-            margin=dict(l=20, r=20, t=20, b=20),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            showlegend=False
-        )
-        st.plotly_chart(fig_factors, use_container_width=True)
-
-    # Caine Intensity-Duration (I-D) Threshold Curve
-    st.markdown("---")
-    st.markdown("#### ⚡ Hydrological Intensity-Duration (I-D) Stability Envelope")
-    st.caption(r"Calibrated Eastern Himalayan empirical rainfall threshold curve ($I = 14.82 \cdot D^{-0.39}$). Operating point above the curve signals high failure risk.")
-
-    durations = np.linspace(1, 72, 80)
-    critical_intensities = 14.82 * (durations ** -0.39)
-    current_duration = 24.0
-    current_intensity = active_telemetry["actual_mean_intensity"]
-
-    fig_id = go.Figure()
-    fig_id.add_trace(go.Scatter(
-        x=durations, y=critical_intensities, mode="lines", name="Eastern Himalayan Threshold Line (GSI / Caine)",
-        line=dict(color="#F87171", width=3)
-    ))
-    fig_id.add_trace(go.Scatter(
-        x=[current_duration], y=[current_intensity], mode="markers", name=f"{active_telemetry['station_id']} Operating Point",
-        marker=dict(color=active_telemetry["color"], size=16, symbol="star", line=dict(color="white", width=2))
-    ))
-    fig_id.update_layout(
-        xaxis_title="Storm Duration D (Hours)",
-        yaxis_title="Mean Rainfall Intensity I (mm/hour)",
-        height=280,
-        margin=dict(l=20, r=20, t=20, b=20),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)"
+# --------------------------------------------------------------------------
+# Station
+# --------------------------------------------------------------------------
+with tab_station:
+    tc = tier_color(active["tier"], active["color"])
+    ttf = active.get("ttf_hours")
+    ttf_html = (
+        f'<div class="ttf">Estimated time to failure: about {esc(ttf)} hours (Saito inverse-velocity method)</div>'
+        if ttf else ""
     )
-    st.plotly_chart(fig_id, use_container_width=True)
 
-# ---------------- TAB 3: SENSOR SANDBOX ----------------
+    md(
+        f"""
+<div class="st-name">{esc(active['station_name'])}</div>
+<div class="meta">
+  <div><div class="k">State</div><div class="v">{esc(active['state'])}</div></div>
+  <div><div class="k">District</div><div class="v">{esc(active['district'])}</div></div>
+  <div><div class="k">Elevation</div><div class="v">{fmt(active['elevation_m'], 0)} m</div></div>
+  <div><div class="k">Slope</div><div class="v">{fmt(active['slope_deg'], 0)}°</div></div>
+  <div><div class="k">Lithology</div><div class="v">{esc(active['lithology'])}</div></div>
+</div>
+<div class="status" style="--tc:{tc};--bg:{rgba(tc, 0.1)}">
+  <div class="tier">{chip(active['tier'].capitalize(), active['tier'])}<small>{esc(active['tier_label'])}</small></div>
+  <div class="dir">{esc(active['action_code'])}</div>
+  {ttf_html}
+  {meter_html(active['lsi'])}
+</div>
+"""
+    )
+
+    section("Sensor readings", "The black tick on each bar is the level where the model starts to flag this sensor.")
+    sc1, sc2 = st.columns(2, gap="large")
+    with sc1:
+        md(sensor_html("24-hour rainfall", active["rainfall_24h"], "mm", 150, 350))
+        md(sensor_html("Pore water pressure", active["pore_water_pressure_kpa"], "kPa", 45, 80))
+    with sc2:
+        md(sensor_html("Soil moisture", active["soil_moisture_pct"], "%", 85, 100))
+        md(sensor_html("Displacement rate", active["displacement_rate_mm_day"], "mm/day", 8, 30))
+
+    st.write("")
+    c_trend, c_factors = st.columns([3, 2], gap="large")
+
+    with c_trend:
+        section("Last 24 hours", "Hourly rain against pore pressure and slope movement.")
+        np.random.seed(zlib.crc32(f"{active['station_id']}-{st.session_state['tick']}".encode()))
+        df_24h = simulator.generate_24h_history(active)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=df_24h["Time"], y=df_24h["Rainfall_mm"], name="Rain (mm/h)", marker_color="rgba(79,124,172,.55)"))
+        fig.add_trace(go.Scatter(x=df_24h["Time"], y=df_24h["Pore_Pressure_kPa"], name="Pore pressure (kPa)",
+                                 line=dict(color="#6B4E9B", width=3), yaxis="y2"))
+        fig.add_trace(go.Scatter(x=df_24h["Time"], y=df_24h["Displacement_mm_day"], name="Displacement (mm/day)",
+                                 line=dict(color=INK, width=2.5, dash="dot"), yaxis="y2"))
+        style_fig(fig, 340)
+        fig.update_layout(
+            yaxis=dict(title="Rain (mm/h)"),
+            yaxis2=dict(title="kPa and mm/day", overlaying="y", side="right", showgrid=False),
+        )
+        plot(fig)
+
+    with c_factors:
+        section("Why this score", "The inputs that contribute most to this score. A green bar, when one appears, is holding risk down.")
+        factors = pd.DataFrame(active["top_factors"])
+        if not factors.empty:
+            fig_f = px.bar(
+                factors, x="score", y="factor", orientation="h", color="direction",
+                color_discrete_map={"Aggravating": TIER_COLOR["RED"], "Mitigating": TIER_COLOR["GREEN"]},
+                labels={"score": "Contribution", "factor": ""},
+            )
+            style_fig(fig_f, 340)
+            fig_f.update_layout(showlegend=False, yaxis=dict(autorange="reversed"))
+            plot(fig_f)
+        else:
+            st.info("No factor breakdown is available for this station.")
+
+    section(
+        "Rainfall intensity and duration",
+        "A storm above the line has historically triggered slides in the Eastern Himalaya "
+        "(I = 14.82 × D<sup>-0.39</sup>).",
+    )
+    durations = np.linspace(1, 72, 80)
+    critical = 14.82 * durations ** -0.39
+    now_i = float(active["actual_mean_intensity"])
+    ymax = max(float(critical.max()), now_i * 1.3)
+    fig_id = go.Figure()
+    fig_id.add_trace(go.Scatter(x=durations, y=critical, mode="lines", name="Threshold", line=dict(color=INK, width=3)))
+    fig_id.add_trace(go.Scatter(x=[1, 72], y=[ymax, ymax], mode="lines", line=dict(width=0), fill="tonexty",
+                                fillcolor="rgba(214,52,44,.09)", name="Failure-prone", hoverinfo="skip"))
+    fig_id.add_trace(go.Scatter(x=[24], y=[now_i], mode="markers", name="This station, 24 h",
+                                marker=dict(color=tc, size=16, symbol="diamond", line=dict(color="white", width=2))))
+    style_fig(fig_id, 300)
+    fig_id.update_layout(xaxis_title="Storm duration (hours)", yaxis_title="Mean intensity (mm/h)")
+    fig_id.update_yaxes(range=[0, ymax])
+    plot(fig_id)
+
+# --------------------------------------------------------------------------
+# Sandbox
+# --------------------------------------------------------------------------
 with tab_sandbox:
-    st.markdown("### 📡 Interactive Sensor Simulation Sandbox (Live Judge Demonstration)")
-    st.caption("Manipulate any environmental or geotechnical variable in real time to observe instantaneous model inference and threshold triggers.")
+    section(
+        "Sensor sandbox",
+        f"Change any value for {esc(active['station_name'])} and the model re-scores it immediately.",
+    )
+    sb_left, sb_right = st.columns(2, gap="large")
 
-    sb_c1, sb_c2 = st.columns([1, 1])
+    with sb_left:
+        sb_rain = st.slider("24-hour rainfall (mm)", 0.0, 350.0, float(active["rainfall_24h"]), 5.0, key=f"sb_rain_{sb_suffix}")
+        sb_slope = st.slider("Slope angle (°)", 15.0, 65.0, float(active["slope_deg"]), 1.0, key=f"sb_slope_{sb_suffix}")
+        sb_pwp = st.slider("Pore water pressure (kPa)", 0.0, 85.0, float(active["pore_water_pressure_kpa"]), 1.0, key=f"sb_pwp_{sb_suffix}")
+        sb_disp = st.slider("Displacement rate (mm/day)", 0.0, 35.0, float(active["displacement_rate_mm_day"]), 0.5, key=f"sb_disp_{sb_suffix}")
+        sb_moist = st.slider("Soil moisture (%)", 15.0, 99.0, float(active["soil_moisture_pct"]), 1.0, key=f"sb_moist_{sb_suffix}")
+        sb_pga = st.slider("Peak ground acceleration (g)", 0.01, 0.45, float(active["seismic_pga_g"]), 0.01, key=f"sb_pga_{sb_suffix}")
 
-    with sb_c1:
-        st.markdown("#### 🎛️ Slope & Atmospheric Sliders")
-        sb_rain = st.slider("24-Hour Rainfall Accumulation (mm)", 0.0, 350.0, float(active_telemetry["rainfall_24h"]), 5.0, key="sb_rain")
-        sb_slope = st.slider("Terrain Slope Angle (°)", 15.0, 65.0, float(active_telemetry["slope_deg"]), 1.0, key="sb_slope")
-        sb_pwp = st.slider("Pore Water Pressure (kPa)", 0.0, 85.0, float(active_telemetry["pore_water_pressure_kpa"]), 1.0, key="sb_pwp")
-        sb_disp = st.slider("Inclinometer Displacement Rate (mm/day)", 0.0, 35.0, float(active_telemetry["displacement_rate_mm_day"]), 0.5, key="sb_disp")
-        sb_moist = st.slider("Soil Moisture Saturation (%)", 15.0, 99.0, float(active_telemetry["soil_moisture_pct"]), 1.0, key="sb_moist")
-        sb_pga = st.slider("Peak Ground Acceleration - Seismic (g)", 0.01, 0.45, float(active_telemetry["seismic_pga_g"]), 0.01, key="sb_pga")
-
-    with sb_c2:
-        st.markdown("#### 🤖 Real-Time AI Prediction Output")
-        
-        sandbox_input = {
+    with sb_right:
+        result = predictor.predict_risk({
             "slope_deg": sb_slope,
             "rainfall_24h": sb_rain,
             "rainfall_72h_ari": sb_rain * 2.1,
@@ -573,207 +734,194 @@ with tab_sandbox:
             "soil_moisture_pct": sb_moist,
             "pore_water_pressure_kpa": sb_pwp,
             "displacement_rate_mm_day": sb_disp,
-            "lithology_factor": active_telemetry["lithology_factor"],
-            "elevation_m": active_telemetry["elevation_m"],
-            "ndvi": active_telemetry["ndvi"],
-            "seismic_pga_g": sb_pga
-        }
-
-        sandbox_result = predictor.predict_risk(sandbox_input)
-
-        st.markdown(f"""
-        <div style="background-color: {sandbox_result['color']}22; border: 2px solid {sandbox_result['color']}; border-radius: 10px; padding: 20px; text-align: center;">
-            <h2 style="color: {sandbox_result['color']}; margin: 0;">Level: {sandbox_result['tier']}</h2>
-            <h4 style="color: #F8FAFC; margin: 5px 0;">{sandbox_result['tier_label']}</h4>
-            <div style="font-size: 2.8rem; font-weight: 800; color: {sandbox_result['color']}; margin: 10px 0;">
-                {sandbox_result['lsi']} <span style="font-size: 1.2rem; color: #94A3B8;">/ 1.00</span>
-            </div>
-            <p style="color: #CBD5E1; margin-bottom: 0;"><b>Recommended Standard Action:</b><br>{sandbox_result['action_code']}</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("##### 📌 Safety Threshold Summary")
-        col_th1, col_th2 = st.columns(2)
-        with col_th1:
-            st.metric("Rain Intensity Breach?", "YES (Critical)" if sandbox_result["id_threshold_breached"] else "NO (Safe)")
-        with col_th2:
-            st.metric("Saito Est. Time to Failure", f"{sandbox_result['ttf_hours']} hrs" if sandbox_result["ttf_hours"] else "N/A (Stable)")
-
-# ---------------- TAB 4: DRONE AERIAL CRACK DETECTION (CV) ----------------
-with tab_vision:
-    st.markdown("### 🛸 Drone Aerial Crack Detection & Slope Computer Vision")
-    st.caption("Upload optical drone inspection photography or select preloaded aerial surveys to detect surface tension fissures, scarp scarification, and vegetation loss.")
-
-    col_v_input, col_v_out = st.columns([1, 1])
-
-    with col_v_input:
-        st.markdown("#### 📷 Select Drone Survey Imagery")
-        drone_source = st.radio(
-            "Source Mode:",
-            ["Preset Survey Archives (Ready for Demo)", "Upload Custom Drone Image"],
-            horizontal=True
+            "lithology_factor": active["lithology_factor"],
+            "elevation_m": active["elevation_m"],
+            "ndvi": active["ndvi"],
+            "seismic_pga_g": sb_pga,
+        })
+        rc = tier_color(result["tier"], result["color"])
+        md(
+            f"""
+<div class="status" style="--tc:{rc};--bg:{rgba(rc, 0.1)}">
+  <div class="tier">{chip(result['tier'].capitalize(), result['tier'])}<small>{esc(result['tier_label'])}</small></div>
+  <div style="font-family:var(--display);font-weight:700;font-size:3rem;line-height:1.1;margin-top:6px">{fmt(result['lsi'], 2)}<span style="font-size:1.1rem;font-weight:500;color:var(--muted)"> / 1.00</span></div>
+  {meter_html(result['lsi'])}
+  <div class="dir" style="margin-top:10px">{esc(result['action_code'])}</div>
+</div>
+"""
         )
+        breached = "Exceeded" if result["id_threshold_breached"] else "Within limit"
+        ttf_val = f"about {result['ttf_hours']} hours" if result["ttf_hours"] else "Not applicable, slope is stable"
+        md(stat_html("Rainfall intensity threshold", breached) + stat_html("Estimated time to failure", ttf_val))
 
-        img_to_analyze = None
-        if drone_source == "Preset Survey Archives (Ready for Demo)":
-            sample_choice = st.selectbox(
-                "Choose Aerial Survey Locus:",
-                [
-                    "🟢 Intact Forested Mountain Slope (Sikkim Valley - Stable)",
-                    "🟡 Developing Tension Cracks & Fissures (NH-10 Rock Cutting)",
-                    "🔴 Severe Scarp Fracture & Talus Subsidence (Tupul Valley Scar)"
-                ]
-            )
-            sample_dir = os.path.join(os.path.dirname(__file__), "data", "sample_drone_images")
-            if "Intact" in sample_choice:
-                img_path = os.path.join(sample_dir, "sample_stable_slope.jpg")
-            elif "Developing" in sample_choice:
-                img_path = os.path.join(sample_dir, "sample_tension_crack_slope.jpg")
+# --------------------------------------------------------------------------
+# Drone imagery
+# --------------------------------------------------------------------------
+with tab_vision:
+    section(
+        "Drone imagery",
+        "Checks aerial photos for surface cracks, bare ground and vegetation loss, "
+        "then combines the result with the station's sensor index.",
+    )
+    v_left, v_right = st.columns(2, gap="large")
+
+    PRESETS = {
+        "Intact forested slope, Sikkim valley (stable)": "sample_stable_slope.jpg",
+        "Developing tension cracks, NH-10 rock cutting": "sample_tension_crack_slope.jpg",
+        "Severe scarp fracture, Tupul valley": "sample_severe_collapse_scarp.jpg",
+    }
+    image = None
+    with v_left:
+        source = st.radio("Image source", ["Sample surveys", "Upload an image"], horizontal=True)
+        if source == "Sample surveys":
+            choice = st.selectbox("Survey", list(PRESETS.keys()))
+            path = os.path.join(os.path.dirname(__file__), "data", "sample_drone_images", PRESETS[choice])
+            if os.path.exists(path):
+                image = Image.open(path)
             else:
-                img_path = os.path.join(sample_dir, "sample_severe_collapse_scarp.jpg")
-
-            if os.path.exists(img_path):
-                img_to_analyze = Image.open(img_path)
+                st.info(f"Sample image not found. Add {PRESETS[choice]} to data/sample_drone_images.")
         else:
-            uploaded_file = st.file_uploader("Upload Aerial Drone JPG/PNG", type=["jpg", "jpeg", "png"])
-            if uploaded_file:
-                img_to_analyze = Image.open(uploaded_file)
+            up = st.file_uploader("Aerial photo (JPG or PNG)", type=["jpg", "jpeg", "png"])
+            if up:
+                image = Image.open(up)
+        if image:
+            st.image(image, caption="Original photo", **FILL)
 
-        if img_to_analyze:
-            st.image(img_to_analyze, caption="Raw Orthomosaic Aerial Photography", use_container_width=True)
-
-    with col_v_out:
-        st.markdown("#### 🔬 Computer Vision Fissure Analysis & Risk Fusion")
-        if img_to_analyze:
-            v_res = vision_analyzer.analyze_image(img_to_analyze)
-
-            st.image(v_res["annotated_image"], caption="AI Fissure Extraction Overlay (Tension Cracks Highlighted in Red)", use_container_width=True)
-
-            # Score Card
-            st.markdown(f"""
-            <div style="background-color: {v_res['color']}22; border: 2px solid {v_res['color']}; border-radius: 8px; padding: 12px; margin-bottom: 12px;">
-                <b style="color: {v_res['color']}; font-size: 1.1rem;">VISUAL THREAT LEVEL: {v_res['tier']} (VII: {v_res['vii_score']})</b><br>
-                <span style="color: #E2E8F0; font-size: 0.9rem;">{v_res['diagnosis']}</span>
-            </div>
-            """, unsafe_allow_html=True)
-
-            cv1, cv2, cv3 = st.columns(3)
-            with cv1:
-                st.metric("Fissure / Crack Density", f"{v_res['crack_density_pct']}%")
-            with cv2:
-                st.metric("Bare Earth / Debris", f"{v_res['bare_soil_pct']}%")
-            with cv3:
-                st.metric("Vegetation Canopy", f"{v_res['vegetation_pct']}%")
-
-            # Multi-modal fusion with IoT LSI
-            st.markdown("---")
-            st.markdown("##### 🤝 Multi-Modal Fusion (IoT Telemetry + Drone Vision)")
-            st.caption("Fuses geotechnical subsurface sensor telemetry (LSI) with surface drone vision (VII) for dual-verification early warning.")
-            
-            fused_score = round(0.65 * active_telemetry["lsi"] + 0.35 * v_res["vii_score"], 3)
-            st.metric(
-                label=f"Composite Multi-Modal Risk ({active_telemetry['station_id']})",
-                value=f"{fused_score} / 1.00",
-                delta=f"Dual Verified ({'Hazardous' if fused_score >= 0.60 else 'Stable'})"
+    with v_right:
+        if image:
+            v = vision_analyzer.analyze_image(image)
+            vtier = VISION_TIER.get(v["tier"], "GREEN")
+            vc = tier_color(vtier, v["color"])
+            st.image(v["annotated_image"], caption="Detected cracks highlighted in red", **FILL)
+            md(
+                f"""
+<div class="status" style="--tc:{vc};--bg:{rgba(vc, 0.1)};margin-top:14px">
+  <div class="tier">{chip(v['tier'].capitalize(), vtier)}<small>Visual index {fmt(v['vii_score'], 2)}</small></div>
+  <div class="dir">{esc(v['diagnosis'])}</div>
+</div>
+"""
+            )
+            md(
+                stat_html("Crack density", f"{v['crack_density_pct']}%")
+                + stat_html("Bare earth and debris", f"{v['bare_soil_pct']}%")
+                + stat_html("Vegetation cover", f"{v['vegetation_pct']}%")
+            )
+            fused = round(0.65 * active["lsi"] + 0.35 * v["vii_score"], 3)
+            ftier = "RED" if fused >= 0.60 else "GREEN"
+            verdict = "Hazardous" if fused >= 0.60 else "Stable"
+            st.write("")
+            section(
+                f"Combined risk at {esc(active['station_name'])}",
+                "Weights the sensor index at 65% and the visual index at 35%.",
+            )
+            md(
+                f'<div style="font-family:var(--display);font-weight:700;font-size:2.6rem;line-height:1.1">{fmt(fused, 2)}'
+                f'<span style="font-size:1.1rem;font-weight:500;color:var(--muted)"> / 1.00</span>'
+                f'<span style="margin-left:14px">{chip(verdict, ftier, "1rem")}</span></div>'
+                + meter_html(fused)
             )
         else:
-            st.info("Select or upload an aerial slope image to begin Computer Vision inspection.")
+            st.info("Choose a sample survey or upload a photo to start the inspection.")
 
-# ---------------- TAB 5: EARLY WARNING & CAP ALERTS ----------------
-with tab_ews:
-    st.markdown("### 📢 Early Warning System (EWS) & Emergency Dispatch")
-    st.caption("Standardized Common Alerting Protocol (CAP v1.2) payloads and multilingual broadcast dispatches.")
+# --------------------------------------------------------------------------
+# Alerts
+# --------------------------------------------------------------------------
+with tab_alerts:
+    section(
+        "Alerts and dispatch",
+        f"Community messages and the CAP v1.2 payload for {esc(active['station_name'])}.",
+    )
+    a_left, a_right = st.columns(2, gap="large")
 
-    col_ews1, col_ews2 = st.columns([1, 1])
+    with a_left:
+        md('<div class="sec" style="font-size:1.1rem">Community messages</div>')
+        messages = dispatcher.get_multilingual_messages(active)
+        md("".join(f'<div class="msg"><div class="lang">{esc(lang)}</div><p>{esc(msg)}</p></div>' for lang, msg in messages.items()))
 
-    with col_ews1:
-        st.markdown(f"#### 🌐 Multilingual Community Alerts: `{active_telemetry['station_name']}`")
-        messages = dispatcher.get_multilingual_messages(active_telemetry)
-        
-        for lang, msg in messages.items():
-            st.markdown(f"**{lang}:**")
-            st.markdown(f'<div class="sms-box">{msg}</div>', unsafe_allow_html=True)
+        md('<div class="sec" style="font-size:1.1rem;margin-top:18px">Response checklist</div>')
+        tier = active["tier"]
+        key = f"{sb_suffix}_{tier}"
+        st.checkbox("Sirens sounded along vulnerable corridors", value=(tier == "RED"), key=f"c1_{key}")
+        st.checkbox("Highway police halted traffic on NH-10, NH-6 and NH-29", value=(tier in ("RED", "ORANGE")), key=f"c2_{key}")
+        st.checkbox("SDRF and NDRF teams deployed", value=(tier in ("RED", "ORANGE")), key=f"c3_{key}")
+        st.checkbox("Village committees notified on WhatsApp", value=True, key=f"c4_{key}")
 
-        st.markdown("#### 🚨 Standard Operating Protocol (SOP) Action Checklist")
-        st.checkbox("Emergency Sirens Sounded at Vulnerable Corridors", value=(active_telemetry["tier"] == "RED"))
-        st.checkbox("Traffic Halted by Regional Highway Police (NH-10 / NH-6 / NH-29)", value=(active_telemetry["tier"] in ["RED", "ORANGE"]))
-        st.checkbox("Disaster Management (SDRF / NDRF) Deployed", value=(active_telemetry["tier"] in ["RED", "ORANGE"]))
-        st.checkbox("Village Disaster Management Committee (VDMC) WhatsApp Broadcast Dispatched", value=True)
+    with a_right:
+        md('<div class="sec" style="font-size:1.1rem">NDMA SACHET payload (CAP v1.2)</div>')
+        st.json(dispatcher.generate_cap_alert(active), expanded=1)
 
-    with col_ews2:
-        st.markdown("#### 📡 NDMA SACHET CAP v1.2 Payload (Standardized XML/JSON)")
-        cap_payload = dispatcher.generate_cap_alert(active_telemetry)
-        st.json(cap_payload)
-
-        st.markdown("#### 📄 Situation Report (SITREP) Generator")
-        sitrep_text = dispatcher.generate_sitrep_markdown(all_telemetry, selected_scenario_label)
-        
+        md('<div class="sec" style="font-size:1.1rem;margin-top:18px">Situation report</div>')
+        st.caption("All stations for the current scenario, ready for district disaster authorities.")
         st.download_button(
-            label="📥 Download Full Incident SITREP (.md)",
-            data=sitrep_text,
+            "Download situation report (.md)",
+            data=dispatcher.generate_sitrep_markdown(all_telemetry, selected_scenario_label),
             file_name=f"NER_Landslide_SITREP_{selected_station_id}.md",
             mime="text/markdown",
-            use_container_width=True
+            **FILL,
         )
 
-# ---------------- TAB 6: PITCH & ARCHITECTURE ----------------
-with tab_pitch:
-    st.markdown("### 🎓 Tech Expo Project Dossier & System Architecture")
-
-    p_col1, p_col2 = st.columns([1, 1])
-
-    with p_col1:
-        st.markdown("""
-        #### 1. Problem Statement: Why NER?
-        - **Vulnerability:** North Eastern Region (NER) accounts for over **60% of recurring landslide hazards in India**, spanning the fragile young fold Himalayan mountains and Indo-Burma ranges.
-        - **Monsoon Extremes:** Cherrapunji and Mawsynram receive the world's highest annual precipitation (>11,000 mm), rapidly triggering pore water saturation and slope liquefaction.
-        - **Seismic Hazard:** The entire NER falls under **Seismic Zones V and IV**, where micro-tremors continuously destabilize steep highway cuts (NH-10, NH-6, NH-29) and railway tracks (Lumding-Badarpur, Tupul).
-        - **Economic Impact:** Road blockages isolate entire states (e.g., Sikkim during monsoon), disrupting supply lines, healthcare access, and regional tourism.
-
-        #### 2. End-to-End System Architecture
-        ```
-        [Field IoT Sensors]
-          ├── Tipping Bucket Rain Gauge (mm)
-          ├── Campbell TDR Soil Moisture Probe (%)
-          ├── Vibrating Wire Piezometer (kPa)
-          └── In-Place MEMS Inclinometer & Geophone
-                     │ (RS-485 / Modbus)
-        [Edge Node - ESP32 / Solar Powered]
-                     │ (LoRaWAN 865 MHz / 4G Fallback)
-        [Cloud / Fog Processing Server]
-                     │
-        [Physics-Informed AI Engine]
-          ├── Calibrated Random Forest Classifier
-          ├── Eastern Himalayan I-D Threshold Curve
-          └── Saito Inverse-Velocity Failure Predictor
-                     │
-        [Decision Support & EWS Hub]
-          ├── Leaflet GIS Command Center
-          ├── NDMA CAP v1.2 Alert Dispatch (SACHET)
-          └── Multilingual Citizen SMS & Siren Triggers
-        ```
-        """)
-
-    with p_col2:
-        st.markdown("""
-        #### 3. Core Technical Innovations
-        1. **Physics-Informed AI Ensemble:** Unlike pure black-box deep learning, our model integrates geotechnical principles: effective stress reductions via pore water pressure and empirical rainfall intensity-duration curves calibrated specifically for Eastern Himalayan lithology.
-        2. **Saito's Inverse Velocity Forecasting ($1/v$):** Capable of estimating time-to-failure (TtF in hours) during active slope creep, providing actionable evacuation windows before disastrous failure occurs.
-        3. **Edge Resilience & LoRaWAN:** Low-power edge gateways operate even when cellular towers fail during extreme storms, ensuring 100% telemetry uptime.
-        4. **Common Alerting Protocol (CAP v1.2) Compliance:** Ready for direct integration into India's National Disaster Management Authority (NDMA) SACHET alerting framework.
-        5. **Multilingual Dissemination:** Alerts translated instantaneously into local regional languages (Assamese, Hindi, Bengali, Mizo) to reach remote mountain communities effectively.
-
-        #### 4. Model Performance Benchmark
-        - **Validation ROC-AUC:** `0.972`
-        - **False Positive Rate:** `< 4.8%` (minimizing alert fatigue)
-        - **Inference Latency:** `< 12 ms` on edge/cloud gateway
-        - **Sensor Battery Autonomy:** Up to 3.5 years on solar-assisted LiFePO4 cells
-        """)
-
-st.markdown("---")
-st.markdown("""
-<div style="text-align: center; color: #64748B; font-size: 0.85rem;">
-    AI-Based Landslide Early Warning & Risk Monitoring System for the North Eastern Region (NER) | Tech Expo Showcase Edition
+# --------------------------------------------------------------------------
+# About
+# --------------------------------------------------------------------------
+with tab_about:
+    section("How the system works")
+    md(
+        """
+<div class="flow">
+  <div class="stage"><span class="n">1</span><h4>Sense</h4><p>Rain gauges, soil moisture probes, piezometers, inclinometers and geophones on the slope.</p></div>
+  <div class="stage"><span class="n">2</span><h4>Relay</h4><p>Solar ESP32 nodes send readings over LoRaWAN, with 4G as backup when the mesh is down.</p></div>
+  <div class="stage"><span class="n">3</span><h4>Assess</h4><p>A random forest scores each slope, checked against rainfall thresholds and a time-to-failure estimate.</p></div>
+  <div class="stage"><span class="n">4</span><h4>Alert</h4><p>CAP v1.2 alerts, multilingual SMS and WhatsApp messages, sirens and a situation report.</p></div>
 </div>
-""", unsafe_allow_html=True)
+"""
+    )
+
+    ab_left, ab_right = st.columns(2, gap="large")
+    with ab_left:
+        section("Why the North East")
+        md(
+            """
+<div class="prose"><ul>
+<li>Cherrapunji and Mawsynram receive more than 11,000 mm of rain a year, which saturates slopes quickly.</li>
+<li>The region lies in seismic zones IV and V, so tremors weaken steep road and rail cuttings.</li>
+<li>One blocked highway can cut off a state. Sikkim depends on NH-10, and the Kohima corridor on NH-29.</li>
+</ul></div>
+"""
+        )
+        section("What the model uses")
+        md(
+            """
+<div class="prose"><ul>
+<li><b>Random forest.</b> Rainfall history, slope, soil moisture, pore pressure, tilt velocity, lithology, elevation, vegetation and ground shaking go in. A 0 to 1 susceptibility index comes out.</li>
+<li><b>Rainfall threshold.</b> An empirical intensity and duration curve for the Eastern Himalaya.</li>
+<li><b>Saito inverse velocity.</b> When a slope accelerates, the trend is extended to estimate hours to failure.</li>
+</ul></div>
+"""
+        )
+    with ab_right:
+        section("Model", "Read from the trained model file. The training and test data are synthetic.")
+        m = predictor.metrics or {}
+        rows = []
+        if "roc_auc" in m:
+            rows.append(("ROC-AUC on held-out synthetic data", f"{m['roc_auc']}"))
+        if "accuracy" in m:
+            rows.append(("Accuracy on held-out synthetic data", f"{float(m['accuracy']) * 100:.1f}%"))
+        if "samples" in m:
+            rows.append(("Synthetic samples generated", f"{m['samples']:,}"))
+        rows.append(("Median inference time (measured now)", f"{latency_ms:.0f} ms"))
+        md("".join(stat_html(k, v) for k, v in rows))
+        st.write("")
+        section("Alert levels")
+        md(
+            "".join(
+                f'<div class="stat"><span><i class="sw" style="display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:8px;background:{TIER_COLOR[t]}"></i>{t.capitalize()}</span><b>{label}</b></div>'
+                for t, label in (
+                    ("GREEN", "Index below 0.35"),
+                    ("YELLOW", "0.35 to 0.60"),
+                    ("ORANGE", "0.60 to 0.80"),
+                    ("RED", "0.80 and above"),
+                )
+            )
+        )
+
+md('<div class="foot">AI-Based Landslide Early Warning and Risk Monitoring System for the North Eastern Region of India. Tech Expo edition.</div>')
